@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+import torch.fft
 from lightning import seed_everything
 from lightning.pytorch.loggers import WandbLogger
 from PIL import Image
@@ -23,7 +24,214 @@ from src.heads import head
 from src.loss import Loss, LossInputs, LossOutputs
 from src.losses import unifalign
 from src.utils import logger
+from scipy.fftpack import dct, idct
 
+class SGFP(nn.Module):
+    def __init__(self, drop_ratio=0.2, method='mask', mode='feature+grad', eps=1e-5):
+        super().__init__()
+        self.drop_ratio = drop_ratio
+        self.method = method
+        self.mode = mode
+        self.eps = eps
+
+    def get_saliency(self, features, logits=None, labels=None):
+        if self.mode == 'feature':
+            saliency = features.abs()
+        elif self.mode == 'feature+grad' and logits is not None and labels is not None:
+            grads = torch.autograd.grad(outputs=logits, inputs=features,
+                                        grad_outputs=torch.ones_like(logits),
+                                        create_graph=True, retain_graph=True)[0]
+            saliency = (features.abs() + grads.abs()) / 2
+        else:
+            saliency = features.abs()
+        return saliency
+
+    def forward(self, features, logits=None, labels=None):
+        with torch.no_grad():
+            saliency = self.get_saliency(features, logits, labels)
+            B, D = saliency.shape
+            K = max(1, int(self.drop_ratio * D))
+            mask = torch.zeros_like(saliency)
+            topk = torch.topk(saliency, K, dim=1).indices  # [B, K]
+            mask.scatter_(1, topk, 1)
+
+        if self.method == 'mask':
+            perturbed = features * (1 - mask)
+
+        elif self.method == 'noise':
+            noise = torch.randn_like(features) * self.eps
+            perturbed = features + noise * mask
+
+        elif self.method == 'mixup':
+            idx = torch.randperm(B)
+            perturbed = features * (1 - mask) + features[idx] * mask
+
+        elif self.method == 'invert':
+            perturbed = features * (1 - mask) + (-features) * mask
+
+        elif self.method == 'shuffle':
+            shuffled = features.clone()
+            for i in range(B):
+                idx_mask = mask[i].bool()
+                if idx_mask.sum() > 1:
+                    permuted = features[i, idx_mask][torch.randperm(idx_mask.sum())]
+                    shuffled[i, idx_mask] = permuted
+            perturbed = shuffled
+
+        elif self.method == 'zero_mean_noise':
+            noise = torch.randn_like(features) * self.eps
+            noise = noise - noise.mean(dim=1, keepdim=True)
+            perturbed = features + noise * mask
+
+        else:
+            raise NotImplementedError(f"Unknown ASP method: {self.method}")
+
+        return perturbed, mask
+
+
+
+class TCET(nn.Module):
+    def __init__(self, dim, nhead=8, num_layers=2, lambda_contrast=0.05):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=dim, nhead=nhead, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.norm = nn.LayerNorm(dim)
+        self.lambda_contrast = lambda_contrast
+
+    def forward(self, features, video_ids):
+        unique_videos = video_ids.unique()
+        enhanced_features = features.clone()
+        total_loss_contrast = 0
+
+        for vid in unique_videos:
+            idxs = (video_ids == vid).nonzero(as_tuple=True)[0]
+            seq = features[idxs]  # [T, D]
+
+            if seq.size(0) < 2:
+                continue
+
+            cls_tokens = self.cls_token.expand(seq.size(0), -1, -1)
+            seq_with_cls = torch.cat([cls_tokens, seq.unsqueeze(0)], dim=1)  # [1, T+1, D]
+            trans_feat = self.transformer(seq_with_cls)[0, 1:, :]  # ignore cls token for features
+
+            enhanced_features[idxs] = self.norm(seq + trans_feat)  # residual connection
+
+            # Temporal contrastive loss
+            total_loss_contrast += self.temporal_contrastive_loss(trans_feat)
+
+        avg_loss_contrast = total_loss_contrast / len(unique_videos)
+        total_loss = self.lambda_contrast * avg_loss_contrast
+
+        return total_loss, enhanced_features
+
+    def temporal_contrastive_loss(self, seq_features, temperature=0.1):
+        T = seq_features.size(0)
+        if T < 2:
+            return torch.tensor(0., device=seq_features.device)
+
+        anchor = seq_features[:-1]  # [T-1, D]
+        positive = seq_features[1:]  # [T-1, D]
+
+        anchor = F.normalize(anchor, dim=-1)
+        positive = F.normalize(positive, dim=-1)
+
+        logits = torch.matmul(anchor, positive.t()) / temperature
+        labels = torch.arange(logits.size(0), device=seq_features.device)
+
+        return F.cross_entropy(logits, labels)
+
+class SFF(nn.Module):
+    def __init__(self, dim, freq_bands=8, reduction=16, act_layer=nn.GELU):
+        super().__init__()
+        self.dim = dim
+        self.freq_bands = freq_bands
+        self.freq_attn = nn.Sequential(
+            nn.Linear(freq_bands, freq_bands),
+            nn.Sigmoid()
+        )
+        self.freq_gate = nn.Sequential(
+            nn.Linear(freq_bands, freq_bands // 2, bias=False),
+            act_layer(),
+            nn.Linear(freq_bands // 2, freq_bands, bias=False),
+            nn.Sigmoid()
+        )
+        self.freq_proj = nn.Linear(freq_bands, dim)
+        self.dropout = nn.Dropout(0.1)
+        self.norm = nn.LayerNorm(dim)
+    def dct_features(self, x):
+        x_freq = torch.from_numpy(
+            dct(x.detach().cpu().numpy(), type=2, axis=-1, norm='ortho')
+        ).to(x.device).type_as(x)
+        freq_out = x_freq[:, :self.freq_bands]
+        return freq_out
+    def forward(self, x):
+        freq = self.dct_features(x)
+        freq_attn = self.freq_attn(freq)
+        freq_weighted = freq * freq_attn
+        freq_gate = self.freq_gate(freq_weighted)
+        freq_emb = self.freq_proj(freq_weighted * freq_gate)
+        freq_emb = self.norm(freq_emb)
+        freq_emb = self.dropout(freq_emb)
+        return freq_emb
+
+# 通道注意力分支
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.fc1 = nn.Linear(channels, channels // reduction, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(channels // reduction, channels, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        w = self.fc1(x)
+        w = self.relu(w)
+        w = self.fc2(w)
+        w = self.sigmoid(w)
+        return x * w
+
+# 空域MLP分支
+class SpatialMLPEnhance(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim)
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(0.1)
+    def forward(self, x):
+        out = self.mlp(x)
+        out = self.norm(out)
+        out = self.dropout(out)
+        return out
+    
+    
+class FusedFeatureEnhance(nn.Module):
+    def __init__(self, dim, freq_bands=8, reduction=8):
+        super().__init__()
+        self.freq_enhance = SFF(dim, freq_bands, reduction)
+        self.se_enhance = SEBlock(dim, reduction)
+        self.spa_enhance = SpatialMLPEnhance(dim)
+        # 融合MLP
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(dim * 3, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+            nn.LayerNorm(dim),
+            nn.Dropout(0.1)
+        )
+    def forward(self, x):
+        # 三路增强
+        freq_feat = self.freq_enhance(x)
+        se_feat = self.se_enhance(x)
+        spa_feat = self.spa_enhance(x)
+        # 拼接融合
+        fusion = torch.cat([freq_feat, se_feat, spa_feat], dim=-1)
+        out = self.fusion_mlp(fusion)
+        # 残差
+        return out + x
 
 class OutputsForMetrics(nn.Module):
     def __init__(self):
@@ -36,7 +244,6 @@ class OutputsForMetrics(nn.Module):
         self.probs.reset()
         self.labels.reset()
         self.idx.reset()
-
 
 @dataclass
 class Batch:
@@ -61,7 +268,6 @@ class Batch:
             idx=batch.get("idx"),
             paths=batch.get("path"),
         )
-
 
 def slerp(A: torch.Tensor, B: torch.Tensor, t: torch.Tensor | float) -> torch.Tensor:
     """
@@ -96,7 +302,6 @@ def slerp(A: torch.Tensor, B: torch.Tensor, t: torch.Tensor | float) -> torch.Te
 
     return interpolated
 
-
 def compute_across_videos(files: list, probs: np.ndarray, labels: np.ndarray):
     """
     Calculate mean probs for each video across all frames
@@ -123,8 +328,7 @@ def compute_across_videos(files: list, probs: np.ndarray, labels: np.ndarray):
 
     return video_probs, video_labels
 
-
-class DeepfakeDetectionModel(pl.LightningModule):
+class STFFNet(pl.LightningModule):
     def __init__(self, config: Config, verbose: bool = False):
         super().__init__()
         self.config = config
@@ -141,6 +345,12 @@ class DeepfakeDetectionModel(pl.LightningModule):
         self._init_peft()
         self._init_loss()
         self._init_metrics()
+        self.temporal_module = TCET(dim=1024, nhead=8, num_layers=2, lambda_contrast=0.05)
+        self.asp = SGFP(
+            drop_ratio=0.2,     # 可以调整
+            method='shuffle',      # 'mask'/'noise'/'mixup'任选
+            mode='feature+grad' # 或 'feature'
+        )
 
         if verbose:
             self.print_trainable_parameters()
@@ -206,6 +416,8 @@ class DeepfakeDetectionModel(pl.LightningModule):
 
     def _init_head(self):
         features_dim = self.feature_extractor.get_features_dim()
+        self.feature_enhance = FusedFeatureEnhance(dim=features_dim, freq_bands=8, reduction=8)
+        self.model = head.LinearProbe(features_dim, self.config.num_classes)
 
         match self.config.head:
             case Head.Linear:
@@ -249,7 +461,11 @@ class DeepfakeDetectionModel(pl.LightningModule):
 
     def forward(self, inputs) -> head.HeadOutput:
         features = self.feature_extractor(inputs)
+        if features.dim() == 3:
+            features = features.mean(dim=1)
+        features = self.feature_enhance(features)
         outputs = self.model(features)
+
         return outputs
 
     def log_loss(self, loss: LossOutputs, stage: str):
@@ -310,28 +526,46 @@ class DeepfakeDetectionModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         batch = self.get_batch(batch)
-        # outputs = self.forward(batch.images)
         features = self.feature_extractor(batch.images)
         features = self.slerp_feature_augmentation(batch, features)
-        outputs = self.model(features)
 
+        # ====== 时序Transformer增强 ======
+        temporal_loss, enhanced_features = self.temporal_module(features, batch.idx)
+        self.log('train/temporal_loss', temporal_loss, on_step=True, on_epoch=True)
+        # 用增强特征
+        outputs = self.model(enhanced_features)
+        # =================================
+
+        # ==== ASP扰动损失（只在训练阶段）====
+        asp_loss = 0.0
+        if self.training and hasattr(self, "asp"):
+            # logits_labels要有梯度，所以不用 no_grad
+            asp_perturbed, _ = self.asp(
+                enhanced_features, 
+                outputs.logits_labels, 
+                batch.labels
+            )
+            asp_outputs = self.model(asp_perturbed)
+            asp_loss = F.cross_entropy(asp_outputs.logits_labels, batch.labels)
+        # =================================
+
+        # 主loss
         loss_inputs = LossInputs(
             logits_labels=outputs.logits_labels,
             labels=batch.labels,
             embeddings=outputs.features,
         )
-        loss = self.criterion(loss_inputs)
+        main_loss = self.criterion(loss_inputs)
+        total_loss = main_loss.total + 0.3 * temporal_loss + 0.5 * asp_loss  # ASP损失加权
+
         probs = self.get_probs(outputs)
-
-        self.log_loss(loss, "train")
+        self.log_loss(main_loss, "train")
         self.log_aliunif(outputs, batch.labels, "train")
-
-        # Save outputs for metrics calculation
         self.train_step_outputs.labels.update(batch.labels)
         self.train_step_outputs.probs.update(probs.detach())
         self.train_step_outputs.idx.update(batch.idx)
 
-        return loss.total
+        return total_loss
 
     def on_train_start(self):
         logger.print(f"[blue]Logs: {self.logger.log_dir}")
@@ -647,3 +881,10 @@ class DeepfakeDetectionModel(pl.LightningModule):
             }
 
         return optimizers
+
+
+
+
+
+
+
