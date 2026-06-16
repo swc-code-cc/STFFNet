@@ -1,1 +1,1 @@
-from .dfdet import DeepfakeDetectionModel
+from .dfdet import STFFNet
